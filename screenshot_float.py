@@ -15,9 +15,11 @@ import math
 import os
 import sys
 import threading
+import time
 import traceback
 import tkinter as tk
 import winreg
+from ctypes import wintypes
 from io import BytesIO
 from tkinter import filedialog, messagebox, ttk
 
@@ -252,6 +254,44 @@ def add_tooltip(widget, text, delay=450):
 COLOR_NAMES = {"#E24B4A": "红色", "#EF9F27": "橙色", "#378ADD": "蓝色",
                "#1D9E75": "绿色", "#2C2C2A": "黑色"}
 ACCENT = "#07C160"          # 微信绿
+
+# ---- Windows 原生全局热键 (RegisterHotKey, 不受其他钩子软件干扰) ----
+WM_HOTKEY = 0x0312
+WM_QUIT = 0x0012
+MOD_NOREPEAT = 0x4000
+MOD_MAP = {"ctrl": 0x0002, "alt": 0x0001, "shift": 0x0004, "windows": 0x0008,
+           "win": 0x0008}
+VK_MAP = {"space": 0x20, "enter": 0x0D, "return": 0x0D, "esc": 0x1B,
+          "escape": 0x1B, "tab": 0x09, "backspace": 0x08, "delete": 0x2E,
+          "del": 0x2E, "insert": 0x2D, "home": 0x24, "end": 0x23,
+          "pageup": 0x21, "page up": 0x21, "pagedown": 0x22,
+          "page down": 0x22, "up": 0x26, "down": 0x28, "left": 0x25,
+          "right": 0x27, "printscreen": 0x2C, "print screen": 0x2C,
+          "capslock": 0x14, "pause": 0x13}
+
+
+def hotkey_to_vk_mods(hotkey: str):
+    """把 'ctrl+alt+z' 解析为 (修饰键掩码, 虚拟键码)；无法识别返回 None。"""
+    mods, key = 0, None
+    for part in hotkey.split("+"):
+        p = part.strip().lower()
+        if not p:
+            continue
+        if p in MOD_MAP:
+            mods |= MOD_MAP[p]
+        elif key is None:
+            key = p
+    if key is None:
+        return None
+    if len(key) == 1 and key.isalnum():
+        vk = ord(key.upper())
+    elif key.startswith("f") and key[1:].isdigit() and 1 <= int(key[1:]) <= 24:
+        vk = 0x70 + int(key[1:]) - 1
+    else:
+        vk = VK_MAP.get(key)
+        if vk is None:
+            return None
+    return mods, vk
 
 
 # ============================ 选区框选 ============================
@@ -917,23 +957,32 @@ class SettingsWindow:
         self._hook = keyboard.hook(self._on_capture_key)
 
     def _on_capture_key(self, e):
-        if e.event_type != "down":
-            return
-        mods = {m for m in ("ctrl", "alt", "shift", "windows") if keyboard.is_pressed(m)}
-        if e.name in mods:
-            return  # 还在按修饰键, 等待最终按键
-        if e.name == "esc" and not mods:
-            return self._stop_capture(cancel=True)
-        hotkey = keyboard.get_hotkey_name(sorted(mods | {e.name}))
-        other = "quit_hotkey" if self.capturing == "hotkey" else "hotkey"
-        if hotkey == self.app.config[other]:
-            messagebox.showwarning("冲突", f"该组合键已被「{'截图' if other == 'hotkey' else '退出'}」占用",
-                                   parent=self.win)
-            return self._stop_capture(cancel=True)
-        self.pending[self.capturing] = hotkey
-        {"hotkey": self.var_capture, "quit_hotkey": self.var_quit}[self.capturing]\
-            .set(hotkey.upper())
-        self._stop_capture()
+        if self.capturing is None:
+            return  # 钩子残留时静默忽略, 绝不能在键盘监听线程里抛异常
+        try:
+            if e.event_type != "down":
+                return
+            mods = {m for m in ("ctrl", "alt", "shift", "windows")
+                    if keyboard.is_pressed(m)}
+            if e.name in mods:
+                return  # 还在按修饰键, 等待最终按键
+            if e.name == "esc" and not mods:
+                return self._stop_capture(cancel=True)
+            hotkey = keyboard.get_hotkey_name(sorted(mods | {e.name}))
+            other = "quit_hotkey" if self.capturing == "hotkey" else "hotkey"
+            if hotkey == self.app.config[other]:
+                messagebox.showwarning(
+                    "冲突",
+                    f"该组合键已被「{'截图' if other == 'hotkey' else '退出'}」占用",
+                    parent=self.win)
+                return self._stop_capture(cancel=True)
+            self.pending[self.capturing] = hotkey
+            {"hotkey": self.var_capture,
+             "quit_hotkey": self.var_quit}[self.capturing].set(hotkey.upper())
+            self._stop_capture()
+        except Exception:
+            log_error()
+            self._stop_capture(cancel=True)
 
     def _stop_capture(self, cancel=False):
         if self._hook:
@@ -969,6 +1018,14 @@ class SettingsWindow:
         if changed:
             save_config(self.app.config)
             self.app.register_hotkeys()
+            status = self.app.wait_hotkey_status(1.0)
+            if status and status.get("fail"):
+                messagebox.showwarning(
+                    "快捷键冲突",
+                    "以下快捷键注册失败（可能被其他程序占用）：\n"
+                    + "\n".join(status["fail"])
+                    + "\n\n请换一个组合键。", parent=self.win)
+                return
         self.close()
 
     def close(self):
@@ -1023,21 +1080,61 @@ class App:
             self.root.after(1500, self._selftest)
         self.root.mainloop()
 
-    # ---- 全局热键 ----
+    # ---- 全局热键 (Windows 原生 RegisterHotKey, 独立线程消息循环) ----
     def register_hotkeys(self):
-        if keyboard is None:
-            return
-        for h in self.hotkey_handles:
-            try:
-                keyboard.remove_hotkey(h)
-            except Exception:
-                pass
-        self.hotkey_handles = [
-            keyboard.add_hotkey(self.config["hotkey"],
-                                lambda: self.root.after(0, self._start_selector)),
-            keyboard.add_hotkey(self.config["quit_hotkey"],
-                                lambda: self.root.after(0, self.quit)),
-        ]
+        self._hotkey_gen = getattr(self, "_hotkey_gen", 0) + 1
+        gen = self._hotkey_gen
+        self._hotkey_status = None
+        tid = getattr(self, "_hotkey_tid", None)
+        if tid:  # 通知旧线程退出 (退出时会注销热键)
+            ctypes.windll.user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
+            deadline = time.time() + 1.0
+            while self._hotkey_tid is not None and time.time() < deadline:
+                time.sleep(0.01)
+        actions = [(self.config["hotkey"], "capture"),
+                   (self.config["quit_hotkey"], "quit")]
+        threading.Thread(target=self._hotkey_loop, args=(gen, actions),
+                         daemon=True).start()
+
+    def _hotkey_loop(self, gen, actions):
+        user32 = ctypes.windll.user32
+        self._hotkey_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+        ok, fail, ids = [], [], {}
+        for i, (hotkey, action) in enumerate(actions):
+            parsed = hotkey_to_vk_mods(hotkey)
+            if parsed is None:
+                fail.append(f"{hotkey}（无法识别）")
+                continue
+            mods, vk = parsed
+            kid = 0xB100 + i
+            if user32.RegisterHotKey(None, kid, mods | MOD_NOREPEAT, vk):
+                ids[kid] = action
+                ok.append(hotkey)
+            else:
+                fail.append(hotkey)  # 注册失败 = 被其他程序占用
+        self._hotkey_status = {"ok": ok, "fail": fail}
+        if fail:
+            _write_log("[hotkey] 注册失败(可能被占用): " + ", ".join(fail))
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == WM_HOTKEY and gen == self._hotkey_gen:
+                action = ids.get(msg.wParam)
+                if action == "capture":
+                    self.root.after(0, self._start_selector)
+                elif action == "quit":
+                    self.root.after(0, self.quit)
+        for kid in ids:
+            user32.UnregisterHotKey(None, kid)
+        self._hotkey_tid = None
+
+    def wait_hotkey_status(self, timeout=1.0):
+        """等待热键注册结果, 返回 {'ok': [...], 'fail': [...]} 或 None。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._hotkey_status is not None:
+                return self._hotkey_status
+            time.sleep(0.02)
+        return None
 
     # ---- 托盘 ----
     def setup_tray(self):
@@ -1145,6 +1242,8 @@ class App:
                       "color": "#378ADD", "size": TEXT_SIZE}]
             exported = render_annotations(img, annos)
             _write_log(f"[selftest] export size: {exported.size}")
+            st = self.wait_hotkey_status(1.5)
+            _write_log(f"[selftest] hotkey register status: {st}")
 
             def _done(i, a):
                 self._last_float = FloatImage(

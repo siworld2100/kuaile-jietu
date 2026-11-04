@@ -58,6 +58,7 @@ py -3.12 -m PyInstaller --noconsole --onefile --icon icon.ico --name ScreenshotF
 - **Python 3.12 + tkinter + Pillow + pystray + keyboard**，单文件约 570 行
 - 悬浮窗 `overrideredirect(True) + topmost`，彻底无窗口装饰
 - `SetProcessDpiAwareness(2)` 保证高 DPI 屏幕截取 1:1 像素
+- 全局热键使用 **Windows 原生 RegisterHotKey API**（独立线程消息循环），注册失败即提示快捷键被占用，不受其他软件的键盘钩子干扰
 - 单实例：命名互斥体（`use_last_error=True` 修正 ctypes 错误码读取）
 - 开机自启：`winreg` 写 `HKCU\...\CurrentVersion\Run`，托盘/设置/启动三处状态一致
 - 崩溃日志：`%APPDATA%\ScreenshotFloat\error.log`
